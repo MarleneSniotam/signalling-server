@@ -1,179 +1,188 @@
-// PeerLink Signalling Server
-// Deploy on Railway — handles room join, WebRTC offer/answer/ICE relay
-// Also serves the webapp so join links work: /join/:roomId
+/*
+  PeerLink Signalling Server
+  --------------------------
+  Deploy this on Railway (or any Node.js host).
 
-const http = require('http');
+  HOW TO DEPLOY ON RAILWAY:
+  1. Go to https://railway.app
+  2. Click "New Project" → "Deploy from GitHub repo"
+      OR click "New Project" → "Empty Project" → Add service → "Node.js"
+  3. Create these two files in your project:
+       - server.js  (this file)
+       - package.json  (see bottom of this file)
+  4. Railway will auto-deploy. Done!
+
+  What this server does:
+  - Accepts WebSocket connections
+  - Lets one person CREATE a room with a 6-letter code
+  - Lets another person JOIN that room
+  - Passes messages (offer, answer, ICE candidates) between the two people
+  - Does NOT touch the actual video/audio data — that goes peer-to-peer
+*/
+
 const WebSocket = require('ws');
-const fs = require('fs');
-const path = require('path');
-const url = require('url');
+const http = require('http');
 
 const PORT = process.env.PORT || 3000;
 
-// ── Room registry: roomId → Set of WebSocket clients ──
+// Store active rooms: roomId → array of WebSocket connections (max 2)
 const rooms = new Map();
 
-function joinRoom(roomId, ws) {
-  if (!rooms.has(roomId)) rooms.set(roomId, new Set());
-  rooms.get(roomId).add(ws);
-  ws._room = roomId;
-  console.log(`[ROOM] ${ws._peerId} joined "${roomId}" (${rooms.get(roomId).size} peers)`);
-}
-
-function leaveRoom(ws) {
-  const roomId = ws._room;
-  if (!roomId || !rooms.has(roomId)) return;
-  rooms.get(roomId).delete(ws);
-  console.log(`[ROOM] ${ws._peerId} left "${roomId}" (${rooms.get(roomId).size} peers)`);
-  if (rooms.get(roomId).size === 0) rooms.delete(roomId);
-  else broadcastToRoom(roomId, { type: 'peer-left', peerId: ws._peerId }, ws);
-}
-
-function broadcastToRoom(roomId, msg, excludeWs = null) {
-  const room = rooms.get(roomId);
-  if (!room) return;
-  const json = JSON.stringify(msg);
-  room.forEach(client => {
-    if (client !== excludeWs && client.readyState === WebSocket.OPEN) {
-      client.send(json);
-    }
-  });
-}
-
-function sendToPeer(roomId, msg, senderWs) {
-  // Relay to all others in the room (for 2-person calls, that's just the other peer)
-  broadcastToRoom(roomId, msg, senderWs);
-}
-
-// ── HTTP server — serves the webapp ──
-const WEBAPP_PATH = path.join(__dirname, 'webapp', 'index.html');
-
-function serveWebApp(res, roomId) {
-  let html;
-  try {
-    html = fs.readFileSync(WEBAPP_PATH, 'utf8');
-  } catch {
-    res.writeHead(404);
-    res.end('Webapp not found');
-    return;
-  }
-  // Inject room ID into the page via meta tag for client to pick up
-  html = html.replace('<head>', `<head><meta name="peerlink-room" content="${roomId}" />`);
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-  res.end(html);
-}
-
+// Create HTTP server (Railway needs this for health checks)
 const server = http.createServer((req, res) => {
-  const parsed = url.parse(req.url, true);
-  const pathname = parsed.pathname;
-
-  // CORS
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
-
-  // Health check
-  if (pathname === '/health' || pathname === '/') {
-    const activeRooms = rooms.size;
-    const activePeers = [...rooms.values()].reduce((a, s) => a + s.size, 0);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', activeRooms, activePeers, uptime: process.uptime() }));
-    return;
-  }
-
-  // Join link: /join/:roomId
-  const joinMatch = pathname.match(/^\/join\/([a-zA-Z0-9_-]+)$/);
-  if (joinMatch) {
-    serveWebApp(res, joinMatch[1]);
-    return;
-  }
-
-  // API: room info
-  const roomMatch = pathname.match(/^\/api\/room\/([a-zA-Z0-9_-]+)$/);
-  if (roomMatch) {
-    const r = rooms.get(roomMatch[1]);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ room: roomMatch[1], peers: r ? r.size : 0 }));
-    return;
-  }
-
-  res.writeHead(404);
-  res.end('Not found');
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('PeerLink Signalling Server is running ✓');
 });
 
-// ── WebSocket Server ──
+// Attach WebSocket server
 const wss = new WebSocket.Server({ server });
-let peerCounter = 0;
 
 wss.on('connection', (ws, req) => {
-  ws._peerId = `peer-${++peerCounter}`;
-  ws._room = null;
+  console.log('New connection from:', req.socket.remoteAddress);
 
-  console.log(`[WS] New connection: ${ws._peerId}`);
+  ws.roomId = null;
 
-  ws.on('message', (raw) => {
+  ws.on('message', (data) => {
     let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
+    try {
+      msg = JSON.parse(data.toString());
+    } catch {
+      return; // ignore malformed messages
+    }
 
-    const room = msg.room;
-    if (!room && msg.type !== 'ping') return;
+    console.log('Message type:', msg.type, '| Room:', msg.room || '-');
 
     switch (msg.type) {
-      case 'join':
-        joinRoom(room, ws);
-        // Notify existing peers
-        const roomSize = rooms.get(room)?.size || 0;
-        if (roomSize > 1) {
-          // Tell existing peers someone joined
-          broadcastToRoom(room, { type: 'peer-joined', peerId: ws._peerId, peerCount: roomSize }, ws);
-          // Tell the newcomer how many peers are already there
-          ws.send(JSON.stringify({ type: 'room-state', peerCount: roomSize - 1 }));
+
+      // ── Someone wants to CREATE a room ──────────────────
+      case 'create': {
+        const roomId = msg.room;
+        if (!roomId) return;
+
+        if (rooms.has(roomId)) {
+          ws.send(JSON.stringify({ type: 'error', message: 'Room already exists. Try again.' }));
+          return;
+        }
+
+        rooms.set(roomId, [ws]);
+        ws.roomId = roomId;
+        ws.send(JSON.stringify({ type: 'room-created', room: roomId }));
+        console.log('Room created:', roomId);
+        break;
+      }
+
+      // ── Someone wants to JOIN a room ─────────────────────
+      case 'join': {
+        const roomId = msg.room;
+        if (!roomId) return;
+
+        const room = rooms.get(roomId);
+        if (!room) {
+          ws.send(JSON.stringify({ type: 'error', message: 'Room not found. Check the code.' }));
+          return;
+        }
+        if (room.length >= 2) {
+          ws.send(JSON.stringify({ type: 'error', message: 'Room is full (2 people max).' }));
+          return;
+        }
+
+        room.push(ws);
+        ws.roomId = roomId;
+
+        // Tell the joiner they're in
+        ws.send(JSON.stringify({ type: 'room-joined', room: roomId }));
+
+        // Tell the host someone joined (host makes the offer)
+        const host = room[0];
+        if (host && host.readyState === WebSocket.OPEN) {
+          host.send(JSON.stringify({ type: 'room-joined', room: roomId }));
+        }
+
+        console.log('Peer joined room:', roomId);
+        break;
+      }
+
+      // ── Relay: offer, answer, ice-candidate, leave ───────
+      case 'offer':
+      case 'answer':
+      case 'ice-candidate':
+      case 'leave': {
+        const roomId = msg.room || ws.roomId;
+        if (!roomId) return;
+
+        const room = rooms.get(roomId);
+        if (!room) return;
+
+        // Send to the OTHER person in the room
+        room.forEach(peer => {
+          if (peer !== ws && peer.readyState === WebSocket.OPEN) {
+            peer.send(JSON.stringify(msg));
+          }
+        });
+
+        if (msg.type === 'leave') {
+          cleanup(ws);
         }
         break;
-
-      case 'offer':
-        sendToPeer(room, { type: 'offer', sdp: msg.sdp, from: ws._peerId }, ws);
-        break;
-
-      case 'answer':
-        sendToPeer(room, { type: 'answer', sdp: msg.sdp, from: ws._peerId }, ws);
-        break;
-
-      case 'ice':
-        sendToPeer(room, { type: 'ice', candidate: msg.candidate, from: ws._peerId }, ws);
-        break;
-
-      case 'leave':
-        leaveRoom(ws);
-        break;
-
-      case 'ping':
-        ws.send(JSON.stringify({ type: 'pong' }));
-        break;
+      }
     }
   });
 
-  ws.on('close', () => leaveRoom(ws));
-  ws.on('error', (e) => console.error(`[WS] Error ${ws._peerId}:`, e.message));
+  ws.on('close', () => {
+    console.log('Connection closed, room:', ws.roomId);
+    cleanup(ws);
+  });
 
-  // Keepalive
-  ws.isAlive = true;
-  ws.on('pong', () => ws.isAlive = true);
+  ws.on('error', (err) => {
+    console.error('WebSocket error:', err.message);
+    cleanup(ws);
+  });
 });
 
-// Heartbeat to clean up dead connections
-setInterval(() => {
-  wss.clients.forEach(ws => {
-    if (!ws.isAlive) { leaveRoom(ws); ws.terminate(); return; }
-    ws.isAlive = false;
-    ws.ping();
+function cleanup(ws) {
+  const roomId = ws.roomId;
+  if (!roomId) return;
+
+  const room = rooms.get(roomId);
+  if (!room) return;
+
+  // Notify the other person
+  room.forEach(peer => {
+    if (peer !== ws && peer.readyState === WebSocket.OPEN) {
+      peer.send(JSON.stringify({ type: 'peer-left' }));
+    }
   });
-}, 30000);
+
+  // Remove this person from the room
+  const updated = room.filter(p => p !== ws);
+  if (updated.length === 0) {
+    rooms.delete(roomId);
+    console.log('Room deleted:', roomId);
+  } else {
+    rooms.set(roomId, updated);
+  }
+
+  ws.roomId = null;
+}
 
 server.listen(PORT, () => {
-  console.log(`\n🚀 PeerLink Signalling Server running on port ${PORT}`);
-  console.log(`   WebSocket: ws://localhost:${PORT}`);
-  console.log(`   HTTP:      http://localhost:${PORT}`);
-  console.log(`   Join URL:  http://localhost:${PORT}/join/:roomId\n`);
+  console.log(`PeerLink signalling server running on port ${PORT}`);
 });
+
+/*
+  ─────────────────────────────────────────────────────
+  PACKAGE.JSON — create this as a separate file too:
+  ─────────────────────────────────────────────────────
+
+  {
+    "name": "peerlink-signalling",
+    "version": "1.0.0",
+    "main": "server.js",
+    "scripts": {
+      "start": "node server.js"
+    },
+    "dependencies": {
+      "ws": "^8.16.0"
+    }
+  }
+*/
