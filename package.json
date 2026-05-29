@@ -1,17 +1,14 @@
 {
-  "name": "peer-chat-signalling",
+  "name": "peerlink-signalling",
   "version": "1.0.0",
-  "description": "Minimal WebRTC signalling server for peer.chat",
+  "description": "PeerLink WebRTC Signalling Server + Webapp Host",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "node --watch server.js"
   },
   "dependencies": {
-    "ws": "^8.16.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.0"
+    "ws": "^8.17.0"
   },
   "engines": {
     "node": ">=18.0.0"
