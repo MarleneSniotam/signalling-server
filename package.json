@@ -1,12 +1,15 @@
 {
-  "name": "peerlink-signalling",
+  "name": "signal-tower-peerlink",
   "version": "1.0.0",
-  "description": "WebRTC signalling server for PeerLink video chat",
+  "description": "Signal Tower PeerLink — multi-viewer WebRTC signalling server for CyberTheatron.LGBT",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
-    "ws": "^8.16.0"
+    "ws": "^8.18.0"
   }
 }
