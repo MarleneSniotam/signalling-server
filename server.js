@@ -286,19 +286,19 @@ wss.on('connection', (ws, req) => {
       const targetNodeId = String(msg.nodeId || '').toLowerCase().trim();
       const message      = String(msg.message || '').slice(0, 500);
       if (!targetNodeId || !message) return;
-      const msgId = uid();
+      const msgId  = msg.id || uid();   // use client-supplied id if provided
       const sentAt = new Date().toISOString();
       const room = stRooms.get(targetNodeId);
       if (room) {
         // Node is connected — deliver live
         send(room.hostWs, { type: 'operator-message', id: msgId, message, sentAt });
-        send(ws, { type: 'admin-msg-status', nodeId: targetNodeId, status: 'live' });
+        send(ws, { type: 'admin-msg-status', nodeId: targetNodeId, status: 'live', id: msgId });
         console.log('[ST] ADMIN msg → live node:', targetNodeId);
       } else {
         // Node offline — queue in memory, delivered on next register-host
         if (!pendingMotd.has(targetNodeId)) pendingMotd.set(targetNodeId, []);
         pendingMotd.get(targetNodeId).push({ id: msgId, message, sentAt });
-        send(ws, { type: 'admin-msg-status', nodeId: targetNodeId, status: 'queued' });
+        send(ws, { type: 'admin-msg-status', nodeId: targetNodeId, status: 'queued', id: msgId });
         console.log('[ST] ADMIN msg queued for offline node:', targetNodeId);
       }
       return;
