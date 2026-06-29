@@ -40,6 +40,13 @@ const stPeers = new Map();
 // peerId → ws  (all currently connected admin panels)
 const stAdmins = new Map();
 
+// ── Security staff connections ────────────────────────────────────────────────
+// peerId → ws  (all currently connected security.html sessions)
+const secSessions = new Map();
+// In-memory current security alert and MOTD (cleared on server restart)
+let secCurrentAlert = null;  // { message } or null
+let secCurrentMotd  = null;  // { message } or null
+
 // ── Offline MOTD queue (admin → node, held until node connects) ───────────────
 // nodeId → [{ id, message, sentAt }]
 const pendingMotd = new Map();
@@ -271,9 +278,11 @@ wss.on('connection', (ws, req) => {
       }
       peer.role = 'admin';
       stAdmins.set(stPeerId, ws);
-      // Send all pending (unresolved) contacts so admin sees them immediately
+      // Send all pending (unresolved) contacts + current security alert/motd
       const contacts = Array.from(pendingContacts.values()).filter(c => !c.resolved);
-      send(ws, { type: 'admin-registered', pendingContacts: contacts });
+      send(ws, { type: 'admin-registered', pendingContacts: contacts,
+                 secAlert: secCurrentAlert ? secCurrentAlert.message : null,
+                 secMotd:  secCurrentMotd  ? secCurrentMotd.message  : null });
       console.log('[ST] ADMIN connected, pending contacts:', contacts.length);
       return;
     }
@@ -371,6 +380,56 @@ wss.on('connection', (ws, req) => {
       console.log('[ST] ADMIN resolved contact:', msg.contactId, 'for node:', contact.nodeId);
       return;
     }
+
+    // ── SECURITY STAFF ────────────────────────────────────────────────────
+    // Security page connects and registers — gets current alert/motd delivered
+    if (msg.type === 'register-security') {
+      peer.role = 'security';
+      secSessions.set(stPeerId, ws);
+      send(ws, { type: 'security-registered' });
+      if (secCurrentAlert) send(ws, { type: 'security-alert',  message: secCurrentAlert.message });
+      if (secCurrentMotd)  send(ws, { type: 'security-motd',   message: secCurrentMotd.message  });
+      console.log('[ST] SECURITY session registered, total:', secSessions.size);
+      return;
+    }
+
+    // Admin broadcasts a live alert to all security sessions
+    if (msg.type === 'security-broadcast-alert') {
+      if (peer.role !== 'admin') return;
+      const message = String(msg.message || '').slice(0, 300);
+      if (!message) return;
+      secCurrentAlert = { message };
+      secSessions.forEach(secWs => send(secWs, { type: 'security-alert', message }));
+      send(ws, { type: 'security-alert-ack', status: 'ok', sessions: secSessions.size });
+      console.log('[ST] SECURITY alert broadcast to', secSessions.size, 'sessions');
+      return;
+    }
+
+    // Admin clears the security live alert
+    if (msg.type === 'clear-security-alert') {
+      if (peer.role !== 'admin') return;
+      secCurrentAlert = null;
+      secSessions.forEach(secWs => send(secWs, { type: 'clear-security-alert' }));
+      return;
+    }
+
+    // Admin saves a security MOTD (delivered on next security session connect)
+    if (msg.type === 'security-broadcast-motd') {
+      if (peer.role !== 'admin') return;
+      const message = String(msg.message || '').slice(0, 300);
+      if (!message) return;
+      secCurrentMotd = { message };
+      secSessions.forEach(secWs => send(secWs, { type: 'security-motd', message }));
+      send(ws, { type: 'security-motd-ack', status: 'ok' });
+      return;
+    }
+
+    // Admin clears the security MOTD
+    if (msg.type === 'clear-security-motd') {
+      if (peer.role !== 'admin') return;
+      secCurrentMotd = null;
+      return;
+    }
   });
 
   ws.on('close', () => {
@@ -426,6 +485,9 @@ function stCleanup(peerId) {
   } else if (peer.role === 'admin') {
     stAdmins.delete(peerId);
     console.log('[ST] ADMIN disconnected');
+  } else if (peer.role === 'security') {
+    secSessions.delete(peerId);
+    console.log('[ST] SECURITY session disconnected, remaining:', secSessions.size);
   }
   stPeers.delete(peerId);
 }
