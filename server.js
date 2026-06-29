@@ -10,7 +10,10 @@
      Messages: register-host, join-room, offer*, answer*, ice-candidate*, kick, host-update
      (* routed by msg.to peerId instead of msg.room)
 
-  The two protocols share the same server.js and the same Railway service.
+  3. Admin messaging (CyberTheatron.LGBT)
+     Messages: register-admin, admin-to-node, node-to-admin, resolve-contact, motd-read
+
+  The two client protocols share the same server.js and the same Railway service.
   No changes needed to the existing cyberphon.link client code.
 */
 
@@ -20,7 +23,8 @@ const fs        = require('fs');
 const path      = require('path');
 const url       = require('url');
 
-const PORT = process.env.PORT || 8080;
+const PORT        = process.env.PORT || 8080;
+const BEACON_URL  = process.env.BEACON_URL || 'https://cybertheatron-beacon.andreaoxygen.workers.dev';
 
 // ── CyberPhon 1-to-1 rooms ────────────────────────────────────────────────────
 // roomId → { host: ws, guest: ws|null }
@@ -29,8 +33,22 @@ const cpRooms = new Map();
 // ── Signal Tower 1-to-many rooms ─────────────────────────────────────────────
 // nodeId  → { hostPeerId, hostWs, viewers: Map<peerId, {ws, handle}> }
 const stRooms = new Map();
-// peerId  → { ws, nodeId, role: 'host'|'viewer'|null }
+// peerId  → { ws, nodeId, role: 'host'|'viewer'|'admin'|null }
 const stPeers = new Map();
+
+// ── Admin connections ─────────────────────────────────────────────────────────
+// peerId → ws  (all currently connected admin panels)
+const stAdmins = new Map();
+
+// ── Offline MOTD queue (admin → node, held until node connects) ───────────────
+// nodeId → [{ id, message, sentAt }]
+const pendingMotd = new Map();
+
+// ── Node contact messages (node → admin) ─────────────────────────────────────
+// contactId → { id, nodeId, callsign, message, email, sentAt, resolved }
+const pendingContacts = new Map();
+// nodeId → contactId  (max one unresolved contact per node)
+const pendingContactByNode = new Map();
 
 function uid() {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
@@ -65,11 +83,14 @@ const server = http.createServer((req, res) => {
   if (pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      status  : 'ok',
-      service : 'PeerLink + Signal Tower',
-      cpRooms : cpRooms.size,
-      stRooms : stRooms.size,
-      stPeers : stPeers.size,
+      status        : 'ok',
+      service       : 'PeerLink + Signal Tower',
+      cpRooms       : cpRooms.size,
+      stRooms       : stRooms.size,
+      stPeers       : stPeers.size,
+      stAdmins      : stAdmins.size,
+      pendingMotd   : pendingMotd.size,
+      pendingContacts: pendingContacts.size,
     }));
     return;
   }
@@ -93,7 +114,8 @@ wss.on('connection', (ws, req) => {
   stPeers.set(stPeerId, { ws, nodeId: null, role: null });
   ws._stPeerId = stPeerId;
 
-  ws.on('message', (data) => {
+  // Make the message handler async so we can await the admin key check
+  ws.on('message', async (data) => {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
 
@@ -169,8 +191,15 @@ wss.on('connection', (ws, req) => {
       stRooms.set(nodeId, { hostPeerId: stPeerId, hostWs: ws, viewers: new Map() });
       peer.nodeId = nodeId;
       peer.role   = 'host';
-      send(ws, { type: 'registered', peerId: stPeerId, nodeId });
+
+      // Tell the node whether it has a pending unresolved contact message (locks send button)
+      const contactPending = pendingContactByNode.has(nodeId);
+      send(ws, { type: 'registered', peerId: stPeerId, nodeId, contactPending });
       console.log('[ST] HOST registered:', nodeId);
+
+      // Deliver any queued MOTD messages immediately — no polling needed
+      const queued = pendingMotd.get(nodeId) || [];
+      queued.forEach(m => send(ws, { type: 'operator-message', id: m.id, message: m.message, sentAt: m.sentAt }));
       return;
     }
 
@@ -220,6 +249,120 @@ wss.on('connection', (ws, req) => {
       room.viewers.forEach(({ ws: vws }) =>
         send(vws, { type: 'host-update', data: msg.data })
       );
+      return;
+    }
+
+    // ── ADMIN MESSAGING ───────────────────────────────────────────────────
+
+    // Admin panel connects and authenticates with the operator key.
+    // We verify the key against the beacon — one HTTP request, then the
+    // connection is trusted for its lifetime. No polling.
+    if (msg.type === 'register-admin') {
+      const key = String(msg.key || '');
+      if (!key) { send(ws, { type: 'admin-auth-failed', reason: 'No key provided' }); return; }
+      try {
+        const resp = await fetch(BEACON_URL + '/admin/nodes', {
+          headers: { 'Authorization': 'Bearer ' + key }
+        });
+        if (!resp.ok) { send(ws, { type: 'admin-auth-failed', reason: 'Invalid key' }); return; }
+      } catch(e) {
+        send(ws, { type: 'admin-auth-failed', reason: 'Beacon unreachable' });
+        return;
+      }
+      peer.role = 'admin';
+      stAdmins.set(stPeerId, ws);
+      // Send all pending (unresolved) contacts so admin sees them immediately
+      const contacts = Array.from(pendingContacts.values()).filter(c => !c.resolved);
+      send(ws, { type: 'admin-registered', pendingContacts: contacts });
+      console.log('[ST] ADMIN connected, pending contacts:', contacts.length);
+      return;
+    }
+
+    // Admin sends a targeted message to a specific node.
+    // If the node is live → instant delivery via WebSocket (zero KV ops).
+    // If offline → stored in memory, delivered automatically when node connects.
+    if (msg.type === 'admin-to-node') {
+      if (peer.role !== 'admin') return;
+      const targetNodeId = String(msg.nodeId || '').toLowerCase().trim();
+      const message      = String(msg.message || '').slice(0, 500);
+      if (!targetNodeId || !message) return;
+      const msgId = uid();
+      const sentAt = new Date().toISOString();
+      const room = stRooms.get(targetNodeId);
+      if (room) {
+        // Node is connected — deliver live
+        send(room.hostWs, { type: 'operator-message', id: msgId, message, sentAt });
+        send(ws, { type: 'admin-msg-status', nodeId: targetNodeId, status: 'live' });
+        console.log('[ST] ADMIN msg → live node:', targetNodeId);
+      } else {
+        // Node offline — queue in memory, delivered on next register-host
+        if (!pendingMotd.has(targetNodeId)) pendingMotd.set(targetNodeId, []);
+        pendingMotd.get(targetNodeId).push({ id: msgId, message, sentAt });
+        send(ws, { type: 'admin-msg-status', nodeId: targetNodeId, status: 'queued' });
+        console.log('[ST] ADMIN msg queued for offline node:', targetNodeId);
+      }
+      return;
+    }
+
+    // Node marks an operator message as read — removes it from the queue.
+    if (msg.type === 'motd-read') {
+      if (peer.role !== 'host') return;
+      const queue = pendingMotd.get(peer.nodeId);
+      if (queue) {
+        const idx = queue.findIndex(m => m.id === msg.id);
+        if (idx !== -1) queue.splice(idx, 1);
+        if (queue.length === 0) pendingMotd.delete(peer.nodeId);
+      }
+      // Check if there are more queued messages and deliver the next one
+      const remaining = pendingMotd.get(peer.nodeId) || [];
+      if (remaining.length > 0) {
+        send(ws, { type: 'operator-message', ...remaining[0] });
+      }
+      return;
+    }
+
+    // Node sends a contact message to the operator.
+    // Delivered live if an admin is connected, otherwise held until admin connects.
+    if (msg.type === 'node-to-admin') {
+      if (peer.role !== 'host') return;
+      // Enforce one pending contact per node
+      if (pendingContactByNode.has(peer.nodeId)) {
+        send(ws, { type: 'contact-status', pending: true }); // already waiting
+        return;
+      }
+      const contactId = uid();
+      const contact = {
+        id       : contactId,
+        nodeId   : peer.nodeId,
+        callsign : String(msg.callsign || peer.nodeId).toUpperCase(),
+        message  : String(msg.message || '').slice(0, 500),
+        email    : msg.email ? String(msg.email).slice(0, 120) : null,
+        sentAt   : new Date().toISOString(),
+        resolved : false,
+      };
+      pendingContacts.set(contactId, contact);
+      pendingContactByNode.set(peer.nodeId, contactId);
+      // Forward to all connected admins immediately
+      stAdmins.forEach(adminWs => send(adminWs, { type: 'new-contact', contact }));
+      send(ws, { type: 'contact-status', pending: true, id: contactId });
+      console.log('[ST] NODE contact from:', peer.nodeId, '| admins online:', stAdmins.size);
+      return;
+    }
+
+    // Admin resolves a contact — unlocks that node's send button.
+    if (msg.type === 'resolve-contact') {
+      if (peer.role !== 'admin') return;
+      const contact = pendingContacts.get(msg.contactId);
+      if (!contact) return;
+      contact.resolved = true;
+      pendingContactByNode.delete(contact.nodeId);
+      pendingContacts.delete(msg.contactId);
+      // Notify the node if it is currently connected
+      const room = stRooms.get(contact.nodeId);
+      if (room) send(room.hostWs, { type: 'contact-status', pending: false });
+      // Notify all admins (so other open admin tabs update too)
+      stAdmins.forEach(adminWs => send(adminWs, { type: 'contact-resolved', contactId: msg.contactId }));
+      console.log('[ST] ADMIN resolved contact:', msg.contactId, 'for node:', contact.nodeId);
       return;
     }
   });
@@ -274,6 +417,9 @@ function stCleanup(peerId) {
       room.viewers.delete(peerId);
       send(room.hostWs, { type: 'viewer-left', viewerId: peerId, viewerCount: room.viewers.size });
     }
+  } else if (peer.role === 'admin') {
+    stAdmins.delete(peerId);
+    console.log('[ST] ADMIN disconnected');
   }
   stPeers.delete(peerId);
 }
