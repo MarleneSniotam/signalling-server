@@ -304,7 +304,8 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    // Node marks an operator message as read — removes it from the queue.
+    // Node marks an operator message as read — removes it from the queue
+    // and pushes a read receipt to all connected admins.
     if (msg.type === 'motd-read') {
       if (peer.role !== 'host') return;
       const queue = pendingMotd.get(peer.nodeId);
@@ -313,7 +314,12 @@ wss.on('connection', (ws, req) => {
         if (idx !== -1) queue.splice(idx, 1);
         if (queue.length === 0) pendingMotd.delete(peer.nodeId);
       }
-      // Check if there are more queued messages and deliver the next one
+      // Notify all connected admins that the node read the message
+      stAdmins.forEach(adminWs =>
+        send(adminWs, { type: 'motd-read-receipt', nodeId: peer.nodeId, msgId: msg.id })
+      );
+      console.log('[ST] MOTD read receipt:', peer.nodeId);
+      // Deliver next queued message if any
       const remaining = pendingMotd.get(peer.nodeId) || [];
       if (remaining.length > 0) {
         send(ws, { type: 'operator-message', ...remaining[0] });
