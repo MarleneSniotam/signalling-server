@@ -35,6 +35,8 @@ const cpRooms = new Map();
 const stRooms = new Map();
 // peerId  → { ws, nodeId, role: 'host'|'viewer'|'admin'|null }
 const stPeers = new Map();
+// nodeId  → [{ws, handle}]  viewers waiting for host to come back
+const waitingViewers = new Map();
 
 // ── Admin connections ─────────────────────────────────────────────────────────
 // peerId → ws  (all currently connected admin panels)
@@ -189,7 +191,11 @@ wss.on('connection', (ws, req) => {
     if (msg.type === 'register-host') {
       const nodeId = String(msg.nodeId || '').toLowerCase().trim();
       if (!nodeId) return;
-      // Notify existing viewers if host reconnects
+      // Notify viewers still waiting from a previous session
+      const waiting = waitingViewers.get(nodeId) || [];
+      waiting.forEach(({ ws: vws }) => send(vws, { type: 'host-reconnected' }));
+      waitingViewers.delete(nodeId);
+      // Also notify any viewers still in an existing room (edge case)
       if (stRooms.has(nodeId)) {
         stRooms.get(nodeId).viewers.forEach(({ ws: vws }) =>
           send(vws, { type: 'host-reconnected' })
@@ -472,15 +478,28 @@ function stCleanup(peerId) {
   if (peer.role === 'host' && peer.nodeId) {
     const room = stRooms.get(peer.nodeId);
     if (room && room.hostPeerId === peerId) {
-      room.viewers.forEach(({ ws: vws }) => send(vws, { type: 'host-left' }));
+      // Save viewers to waiting list so we can notify them when host comes back
+      const waiting = [];
+      room.viewers.forEach(({ ws: vws, handle }) => {
+        send(vws, { type: 'host-left' });
+        if (vws.readyState === WebSocket.OPEN) waiting.push({ ws: vws, handle });
+      });
+      if (waiting.length > 0) waitingViewers.set(peer.nodeId, waiting);
       stRooms.delete(peer.nodeId);
-      console.log('[ST] HOST offline:', peer.nodeId);
+      console.log('[ST] HOST offline:', peer.nodeId, '| waiting viewers:', waiting.length);
     }
   } else if (peer.role === 'viewer' && peer.nodeId) {
     const room = stRooms.get(peer.nodeId);
     if (room) {
       room.viewers.delete(peerId);
       send(room.hostWs, { type: 'viewer-left', viewerId: peerId, viewerCount: room.viewers.size });
+    }
+    // Also remove from waiting list if they navigated away while waiting
+    const wl = waitingViewers.get(peer.nodeId);
+    if (wl) {
+      const filtered = wl.filter(v => v.ws !== ws);
+      if (filtered.length > 0) waitingViewers.set(peer.nodeId, filtered);
+      else waitingViewers.delete(peer.nodeId);
     }
   } else if (peer.role === 'admin') {
     stAdmins.delete(peerId);
