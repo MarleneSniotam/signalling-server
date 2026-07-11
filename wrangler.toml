@@ -1,0 +1,17 @@
+name             = "cybertheatron-signal"
+main             = "cf-worker.js"
+compatibility_date = "2024-09-23"
+
+# Environment variables
+[vars]
+BEACON_URL = "https://cybertheatron-beacon.andreaoxygen.workers.dev"
+
+# The Durable Object that holds all WebSocket connections
+[[durable_objects.bindings]]
+name       = "SIGNAL_TOWER"
+class_name = "SignalTower"
+
+# Migration — registers the DO class with Cloudflare the first time you deploy
+[[migrations]]
+tag          = "v1"
+new_classes  = ["SignalTower"]
