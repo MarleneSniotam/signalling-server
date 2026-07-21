@@ -172,22 +172,48 @@ export class SignalTower {
   /** Lazy-load persistent queues from DO storage */
   async _ensureStorage() {
     if (this._storageReady) return;
-    const [motd, contacts, contactByNode, alert, motdMsg] = await Promise.all([
+    const [motd, contacts, contactByNode, alert, motdMsg, cpRoomsData] = await Promise.all([
       this.ctx.storage.get('pendingMotd'),
       this.ctx.storage.get('pendingContacts'),
       this.ctx.storage.get('pendingContactByNode'),
       this.ctx.storage.get('secCurrentAlert'),
       this.ctx.storage.get('secCurrentMotd'),
+      this.ctx.storage.get('cpRooms'),
     ]);
     if (motd)          this.pendingMotd          = new Map(Object.entries(motd));
     if (contacts)      this.pendingContacts       = new Map(Object.entries(contacts));
     if (contactByNode) this.pendingContactByNode  = new Map(Object.entries(contactByNode));
     if (alert)         this.secCurrentAlert       = alert;
     if (motdMsg)       this.secCurrentMotd        = motdMsg;
+    // Restore cpRooms — hostPeerId/guestPeerId refs won't be valid after hibernation
+    // but the room structure is preserved so create/join logic works correctly
+    if (cpRoomsData) {
+      for (const [roomId, room] of Object.entries(cpRoomsData)) {
+        this.cpRooms.set(roomId, {
+          hostPeerId: room.hostPeerId || null,
+          guestPeerId: room.guestPeerId || null,
+          hostReconnecting: room.hostReconnecting || false,
+          hostLeftAt: room.hostLeftAt || null,
+        });
+      }
+    }
     this._storageReady = true;
   }
 
   /** Persist queues + security state to DO storage */
+  async _saveCpRooms() {
+    const obj = {};
+    for (const [roomId, room] of this.cpRooms.entries()) {
+      obj[roomId] = {
+        hostPeerId: room.hostPeerId,
+        guestPeerId: room.guestPeerId,
+        hostReconnecting: room.hostReconnecting || false,
+        hostLeftAt: room.hostLeftAt || null,
+      };
+    }
+    await this.ctx.storage.put('cpRooms', obj);
+  }
+
   async _saveStorage() {
     await Promise.all([
       this.ctx.storage.put('pendingMotd',          Object.fromEntries(this.pendingMotd)),
@@ -267,13 +293,30 @@ export class SignalTower {
     if (msg.type === 'create') {
       const roomId = msg.room;
       if (!roomId) return;
-      if (this.cpRooms.has(roomId)) {
+      const existing = this.cpRooms.get(roomId);
+      if (existing) {
+        if (existing.hostReconnecting && !existing.hostPeerId) {
+          // Host is reclaiming their room after disconnect — allow it
+          existing.hostPeerId = peerId;
+          existing.hostReconnecting = false;
+          existing.hostLeftAt = null;
+          ws.serializeAttachment({ ...att, cpRoomId: roomId, cpRole: 'host' });
+          this._send(ws, { type: 'room-created', room: roomId });
+          // If guest is still connected, notify both sides to reconnect
+          if (existing.guestPeerId) {
+            const gws = this._wsFor(existing.guestPeerId);
+            if (gws) this._send(gws, { type: 'host-reconnected', room: roomId });
+            this._send(ws, { type: 'peer-arrived', room: roomId });
+          }
+          return;
+        }
         this._send(ws, { type: 'error', message: 'Room already exists. Try again.' });
         return;
       }
       this.cpRooms.set(roomId, { hostPeerId: peerId, guestPeerId: null });
       ws.serializeAttachment({ ...att, cpRoomId: roomId, cpRole: 'host' });
       this._send(ws, { type: 'room-created', room: roomId });
+      await this._saveCpRooms();
       return;
     }
 
@@ -293,6 +336,7 @@ export class SignalTower {
       this._send(ws, { type: 'guest-joined', room: roomId });
       const hostWs = this._wsFor(room.hostPeerId);
       if (hostWs) this._send(hostWs, { type: 'peer-arrived', room: roomId });
+      await this._saveCpRooms();
       return;
     }
 
@@ -697,17 +741,33 @@ export class SignalTower {
     if (!room) return;
 
     if (att.cpRole === 'host') {
-      // Host left — notify guest if present
+      // Host left — notify guest if present but keep room alive for 30s
+      // so host can reconnect and reclaim without guest needing to rejoin
       if (room.guestPeerId) {
         const gws = this._wsFor(room.guestPeerId);
         if (gws) this._send(gws, { type: 'peer-left' });
       }
-      this.cpRooms.delete(roomId);
+      // Mark room as host-reconnecting instead of deleting immediately
+      room.hostPeerId = null;
+      room.hostReconnecting = true;
+      room.hostLeftAt = Date.now();
+      await this._saveCpRooms();
+      // Delete after 30 second grace period
+      setTimeout(async () => {
+        const r = this.cpRooms.get(roomId);
+        if (r && r.hostReconnecting && !r.hostPeerId) {
+          this.cpRooms.delete(roomId);
+          await this._saveCpRooms();
+        }
+      }, 30000);
     } else if (att.cpRole === 'guest') {
-      // Guest left — notify host
-      const hws = this._wsFor(room.hostPeerId);
-      if (hws) this._send(hws, { type: 'peer-left' });
+      // Guest left — notify host if still connected
+      if (room.hostPeerId) {
+        const hws = this._wsFor(room.hostPeerId);
+        if (hws) this._send(hws, { type: 'peer-left' });
+      }
       room.guestPeerId = null;
+      this._saveCpRooms();
     }
   }
 }
